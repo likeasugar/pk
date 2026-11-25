@@ -121,8 +121,8 @@ background:#3d1a1a;color:#ffa198;font-size:12px;line-height:1.5"></div>
 <button class="btn" id="loadmore" hidden>加载更多</button>
 <div id="count"></div>
 <footer>数据源：<a href="https://odds.zgzcw.com/" target="_blank" rel="noopener"
-style="color:#58a6ff;text-decoration:none">odds.zgzcw.com</a> 盘口接口，共 350 场 · 点搜索获取所选时间范围；今天和昨天每 60 秒刷新，历史结果保留<br>
-脚本版本 2026-11-25-request-safety<br>
+style="color:#58a6ff;text-decoration:none">odds.zgzcw.com</a> 盘口接口，共 350 场 · 点搜索获取所选时间范围；近期数据每 60 秒检查更新，历史结果保留<br>
+脚本版本 2026-11-25-usability<br>
 预测口径：降盘（让球变少）买上盘，升盘（让球变多）买下盘，按变盘公司多数票；票数相同记为分歧。<br>
 仅供数据参考，不构成投注建议。</footer>
 <div class="toast" id="toast"></div>
@@ -135,7 +135,8 @@ let DATA = CONFIG.rows || [];
 let SNAP = CONFIG.now || "";
 let ISSUE = todayShanghai();
 let RANGE = [];
-let scope = ["pre", "post", "all"].includes(location.hash.slice(1)) ? location.hash.slice(1) : "pre";
+const explicitScope = ["pre", "post", "all"].includes(location.hash.slice(1)) ? location.hash.slice(1) : null;
+let scope = explicitScope || "pre";
 let activeRequest = null;
 let selectionVersion = 0;
 let requestSerial = 0;
@@ -154,6 +155,10 @@ const HISTORY_TTL = 7 * 86400000, RECENT_TTL = 45000, REQUEST_GAP = 2000;
 const MAX_CACHE_BYTES = 30 * 1024 * 1024, MAX_CACHE_ISSUES = 187;
 let historyDbPromise = null;
 let archiveManifestPromise = null;
+let archiveManifestValue = null;
+let archiveManifestReadAt = 0;
+const MANIFEST_TTL = 60000;
+const lastAutomaticRefresh = new Map();
 const issueCache = new Map();
 let visibleLimit = 50;
 const $ = selector => document.querySelector(selector);
@@ -249,9 +254,11 @@ function showStatus(message, kind = "info") {
 }
 window.onerror = function() { showStatus("页面暂时无法更新。" + (DATA.length ? "已有结果已保留。" : "") + "请点击搜索重试。", "warning"); };
 function setScope(value) {
+  if (!["pre","post","all"].includes(value)) return;
   scope = value;
   document.querySelectorAll("[data-scope]").forEach(element => element.classList.toggle("on", element.dataset.scope === value));
   try { if (location.protocol.startsWith("http")) history.replaceState(null, "", "#" + value); } catch (_) { /* Some file viewers disallow history writes. */ }
+  savedSelection={...(savedSelection || {from:$("#from").value,to:$("#to").value}),scope};persistState();
   render();
 }
 function canRemote() { return Boolean(API_BASE || CONFIG.live); }
@@ -314,7 +321,7 @@ function restoreState() {
     for (const item of Array.isArray(state.missing) ? state.missing.slice(-MAX_CACHE_ISSUES) : []) if (Array.isArray(item) && /^\d{4}-\d{2}-\d{2}$/.test(item[0])) missingIssues.set(item[0], String(item[1] || "尚未获取"));
     if (state.selection && typeof state.selection.from === "string" && typeof state.selection.to === "string") {
       $("#from").value = state.selection.from; $("#to").value = state.selection.to;
-      try { buildSearchPlan(); savedSelection = state.selection; if (["pre","post","all"].includes(state.selection.scope)) scope = state.selection.scope; }
+      try { buildSearchPlan(); savedSelection = state.selection; if (!explicitScope && ["pre","post","all"].includes(state.selection.scope)) scope = state.selection.scope; }
       catch (_) { $("#from").value = ""; $("#to").value = ""; }
     }
   } catch (_) { /* Corrupt metadata must not break the page. */ }
@@ -350,8 +357,8 @@ function archiveStable(payload) {
 }
 function cacheFresh(issue, record) {
   if (!currentContract(record?.payload)) return false;
-  const stamp = record?.payload?.archive ? shanghaiTime(record.payload.now) : record?.fetchedAt;
-  const ttl = record?.payload?.archive ? (archiveStable(record.payload) ? HISTORY_TTL : RECENT_TTL) : (issue >= dayOffset(todayShanghai(), -2) ? RECENT_TTL : HISTORY_TTL);
+  const stamp = shanghaiTime(record?.payload?.now);
+  const ttl = archiveStable(record?.payload) ? HISTORY_TTL : RECENT_TTL;
   return !!record && Number.isFinite(stamp) && Date.now() - stamp < ttl && !record.payload.stale;
 }
 async function pruneCache() {
@@ -408,13 +415,17 @@ async function staticJson(url, signal, cache) {
   } catch (error) { if (signal?.aborted) throw abortError(); return null; }
   finally { clearTimeout(timer); signal?.removeEventListener("abort", cancel); }
 }
-async function archiveManifest() {
-  if (!archiveManifestPromise) archiveManifestPromise = (async () => {
-    const base = archiveBaseUrl(); if (!base) return null;
-    const manifest = await staticJson(new URL("index.json", base), null, "no-cache");
-    return manifest?.version === 1 && manifest.issues && typeof manifest.issues === "object" && !Array.isArray(manifest.issues) ? manifest : null;
+async function archiveManifest(options={}) {
+  if(archiveManifestPromise) return archiveManifestPromise;
+  if(!options.refresh && archiveManifestReadAt && Date.now()-archiveManifestReadAt<MANIFEST_TTL) return archiveManifestValue;
+  const task=(async()=>{
+    const base=archiveBaseUrl();if(!base) return null;
+    const manifest=await staticJson(new URL("index.json",base),null,"no-cache");
+    if(manifest?.version===1 && manifest.issues && typeof manifest.issues==="object" && !Array.isArray(manifest.issues)) archiveManifestValue=manifest;
+    archiveManifestReadAt=Date.now();return archiveManifestValue;
   })();
-  return archiveManifestPromise;
+  archiveManifestPromise=task;
+  try{return await task;}finally{if(archiveManifestPromise===task) archiveManifestPromise=null;}
 }
 async function archivedIssue(issue, manifest, signal) {
   const entry = manifest?.issues?.[issue], base = archiveBaseUrl();
@@ -508,15 +519,25 @@ function collectRows(plan) {
   return cached.flatMap(entry=>entry.payload.rows).filter(row=>{const key=row.ko+"|"+row.home+"|"+row.guest;if(seen.has(key)) return false;seen.add(key);return true;});
 }
 function failuresFor(plan) { return plan.issues.filter(issue=>missingIssues.has(issue)).map(issue=>({issue,error:missingIssues.get(issue)})); }
+function automaticIssues(plan) {
+  const today=todayShanghai(),yesterday=dayOffset(today,-1);
+  const recent=plan.issues.filter(issue=>issue>=yesterday && issue<=today).slice().reverse();
+  const unsettled=plan.issues.filter(issue=>issue<yesterday && currentContract(issueCache.get(issue)?.payload) && !archiveStable(issueCache.get(issue).payload) && !cacheFresh(issue,issueCache.get(issue)))
+    .sort((a,b)=>(lastAutomaticRefresh.get(a)||0)-(lastAutomaticRefresh.get(b)||0) || b.localeCompare(a));
+  return [...recent,...unsettled.slice(0,Math.max(0,4-recent.length))];
+}
 async function fetchPlan(plan, signal, options) {
   const today=todayShanghai(), yesterday=dayOffset(today,-1);
-  const targets=(options.automatic ? plan.issues.filter(issue=>issue>=yesterday && issue<=today) : plan.issues).slice().reverse();
-  const manifest=await archiveManifest();
-  let completed=0, paused=Date.now()<nextAllowedAt || (manualResumeRequired && (options.automatic || options.restore));
+  const targets=options.automatic ? automaticIssues(plan) : plan.issues.slice().reverse();
+  const manifest=await archiveManifest({refresh:!options.automatic&&!options.restore});
+  let completed=0, lastProgressAt=-Infinity, paused=Date.now()<nextAllowedAt || (manualResumeRequired && (options.automatic || options.restore));
   for(const issue of targets) {
     if(signal.aborted) throw abortError();
+    if(options.automatic) lastAutomaticRefresh.set(issue,Date.now());
     const cached=issueCache.get(issue);
-    let needLive=!cacheFresh(issue,cached);
+    const announced=shanghaiTime(manifest?.issues?.[issue]?.now);
+    const updatedArchive=Number.isFinite(announced) && (!cached || announced>shanghaiTime(cached.payload.now));
+    let needLive=!cacheFresh(issue,cached) || updatedArchive;
     if(!needLive) {cached.lastUsedAt=Date.now();missingIssues.delete(issue);}
     else {
       const archive=await archivedIssue(issue,manifest,signal);
@@ -527,7 +548,6 @@ async function fetchPlan(plan, signal, options) {
         if(!current || (currentContract(archive) && !currentContract(current.payload)) || (currentContract(archive)===currentContract(current.payload) && shanghaiTime(archive.now)>=shanghaiTime(current.payload.now))) await saveIssue(issue,archive);
         if(currentContract(archive) && archiveStable(archive)) {needLive=false;missingIssues.delete(issue);}
         else needLive=!cacheFresh(issue,issueCache.get(issue));
-        if(options.onProgress) options.onProgress();
       }
       if(needLive) {
         if(paused) missingIssues.set(issue,issueCache.has(issue)?"此日期仅有快照，实时数据暂未取得":"联网已暂停，此日期尚未获取完整数据");
@@ -538,14 +558,19 @@ async function fetchPlan(plan, signal, options) {
         }
       }
     }
-    completed++;persistState();
-    if(!signal.aborted && options.onProgress) options.onProgress();
-    if(!signal.aborted) {
+    completed++;
+    if(!signal.aborted && Date.now()-lastProgressAt>=150) {
+      persistState();
+      if(options.onProgress) options.onProgress();
       const incomplete=failuresFor(plan).length>0;
       showStatus((paused&&incomplete?pauseMessage()+" ":"正在搜索：")+completed+"/"+targets.length+" 个赛程期"+(incomplete?" · 部分数据尚未取得":"")+"。可点击取消。",paused&&incomplete?"warning":"info");
+      lastProgressAt=Date.now();
     }
+    // A paused/cached range otherwise resolves entirely through microtasks and starves tap/cancel events.
+    if(targets.length>12 && completed%8===0) await waitForRetry(0,signal);
   }
   if(signal.aborted) throw abortError();
+  persistState();
   return {responses:responsesFor(plan),failures:failuresFor(plan),paused};
 }
 function resultStatus(plan,responses,failures,paused) {
@@ -578,7 +603,7 @@ function search(options={}) {
   try {plan=buildSearchPlan();} catch(error) {showStatus(error.message,"error");render();return Promise.resolve();}
   if(!options.automatic) {savedSelection={from:$("#from").value,to:$("#to").value,scope};persistState();}
   if(manualResumeRequired && !options.automatic && !options.restore && Date.now()>=nextAllowedAt) {manualResumeRequired=false;blockedReason="";blockedCode="";persistState();}
-  if(options.automatic && (!loadedPlan||!plan.issues.some(issue=>issue>=dayOffset(todayShanghai(),-1)&&issue<=todayShanghai()))) return Promise.resolve();
+  if(options.automatic && (!loadedPlan||!automaticIssues(plan).length)) return Promise.resolve();
   const serial=++requestSerial,version=selectionVersion,controller=new AbortController();
   const request={controller,promise:null,serial};activeRequest=request;
   $("#search").disabled=true;$("#search").textContent="搜索中…";$("#cancel").hidden=false;
@@ -592,7 +617,7 @@ function search(options={}) {
         }
       }});
       if(version!==selectionVersion||serial!==requestSerial||plan.selection!==selectionKey()) return;
-      if(!responses.length) {if(paused) {resultStatus(plan,responses,failures,true);return;}throw new Error(failures.slice(0,3).map(failure=>failure.issue+"："+failure.error).join("；")||"没有收到有效数据");}
+      if(!responses.length) {if(paused) {render();resultStatus(plan,responses,failures,true);return;}throw new Error(failures.slice(0,3).map(failure=>failure.issue+"："+failure.error).join("；")||"没有收到有效数据");}
       DATA=collectRows(plan);SNAP=responses.map(response=>response.now).sort().at(-1);ISSUE=plan.firstDay;RANGE=plan.issues.slice();
       committedSelection=plan.selection;loadedPlan=plan;
       $("#snap").textContent=plan.firstDay+(plan.firstDay===plan.lastDay?"":" 至 "+plan.lastDay)+" · "+SNAP+" 抓取";
@@ -611,7 +636,7 @@ function search(options={}) {
   })();return request.promise;
 }
 function onDateChange() {
-  document.querySelectorAll("[data-range]").forEach(element => element.classList.remove("on"));
+  syncPresetHighlight();
   visibleLimit = 50;
   selectionVersion++;
   requestSerial++;
@@ -620,6 +645,7 @@ function onDateChange() {
   $("#search").disabled = false;
   $("#search").textContent = "🔍 搜索";
   $("#cancel").hidden = true;
+  persistState();
   showStatus("时间条件已更改，请点击搜索获取对应日期的数据。", "warning");
   render();
 }
@@ -631,6 +657,16 @@ function cancelSearch() {
   $("#search").disabled = false;
   $("#search").textContent = "🔍 搜索";
   $("#cancel").hidden = true;
+  persistState();
+  try {
+    const plan=buildSearchPlan(),responses=responsesFor(plan);
+    if(responses.length) {
+      DATA=collectRows(plan);SNAP=responses.map(response=>response.now).sort().at(-1);
+      const partial=responses.length<plan.issues.length || failuresFor(plan).length>0;
+      $("#snap").textContent="搜索已取消 · "+(partial?"已获取部分数据 ":"保留已获取结果 ")+SNAP+" 抓取";
+      render();
+    } else $("#snap").textContent="搜索已取消 · 保留 "+SNAP+" 的已有数据";
+  } catch (_) { $("#snap").textContent="搜索已取消 · 保留已有数据"; }
   showStatus("搜索已取消，保留已获取的数据。", "warning");
 }
 function monthOffset(day, months) {
@@ -639,6 +675,18 @@ function monthOffset(day, months) {
   const last = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
   target.setUTCDate(Math.min(date, last));
   return target.toISOString().slice(0, 10);
+}
+function syncPresetHighlight() {
+  let selected=null;
+  try {
+    const plan=buildSearchPlan(),today=todayShanghai();
+    if(plan.lastDay===today && plan.toMs===shanghaiTime(today+"T23:59")+59999) {
+      for(const [kind,start] of [["today",today],["week",dayOffset(today,-6)],["month",monthOffset(today,-1)],["halfyear",monthOffset(today,-6)]]) {
+        if(plan.fromMs===shanghaiTime(start+"T00:00")) {selected=kind;break;}
+      }
+    }
+  } catch (_) { /* Custom or invalid ranges have no selected shortcut. */ }
+  document.querySelectorAll("[data-range]").forEach(element=>element.classList.toggle("on",element.dataset.range===selected));
 }
 function quickRange(kind) {
   const today = todayShanghai();
@@ -657,7 +705,7 @@ $("#search").onclick = () => search();
 $("#cancel").onclick = cancelSearch;
 $("#loadmore").onclick = () => { visibleLimit += 50; render(); };
 async function initialize() {
-  restoreState();await restoreHistory();setScope(scope);
+  restoreState();await restoreHistory();syncPresetHighlight();setScope(scope);
   const plan=buildSearchPlan();
   if(responsesFor(plan).length) {DATA=collectRows(plan);SNAP=responsesFor(plan).map(response=>response.now).sort().at(-1);render();loadedPlan=plan;}
   committedSelection=selectionKey();
