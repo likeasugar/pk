@@ -68,6 +68,15 @@ display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 font-size:12.5px;color:#9ba7b4;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .stats b{color:#e6edf3;font-size:14px}
 .stats .rate{color:#3fb950;font-weight:700}
+.stats{gap:6px}
+.stats>div{flex-basis:100%;min-width:0;overflow-wrap:anywhere}
+.stats-range,.stats-coverage,.stats-note{font-size:13px;line-height:1.55}
+.stats-status,.stats-sample{font-size:14px;line-height:1.6}
+.stats-status{color:#e6edf3;font-weight:600}
+.stats-incomplete,.stats-incomplete .rate{color:#e3b969}
+.stats-snapshot{color:#79c0ff}
+.stats .stats-sample-incomplete .rate{color:#9ba7b4}
+.stats-note{color:#9ba7b4}
 .empty{color:#8b949e;font-size:13.5px;padding:18px;background:#161b22;border:1px dashed #2a3038;
 border-radius:14px;text-align:center}
 #count{font-size:12px;color:#8b949e;margin-top:14px;text-align:center}
@@ -123,7 +132,7 @@ background:#3d1a1a;color:#ffa198;font-size:12px;line-height:1.5"></div>
 <div id="count"></div>
 <footer>数据源：<a href="https://odds.zgzcw.com/" target="_blank" rel="noopener"
 style="color:#58a6ff;text-decoration:none">odds.zgzcw.com</a> 盘口接口，共 350 场 · 点搜索获取所选时间范围；近期数据每 60 秒检查更新，历史结果保留<br>
-脚本版本 2026-11-25-usability<br>
+脚本版本 2026-11-25-stat-coverage<br>
 预测口径：降盘（让球变少）买上盘，升盘（让球变多）买下盘，按变盘公司多数票；票数相同记为分歧。<br>
 仅供数据参考，不构成投注建议。</footer>
 <div class="toast" id="toast"></div>
@@ -144,6 +153,7 @@ let requestSerial = 0;
 let committedSelection = "";
 let nextAllowedAt = 0;
 let loadedPlan = null;
+let cancelledSelection = null;
 let nextRequestAt = 0;
 let blockedReason = "";
 let blockedCode = "";
@@ -210,6 +220,42 @@ function card(row) {
   }
   return `<div class="card${Math.max(row.rise, row.fall) >= 2 ? " hot" : ""}"><div class="topline"><span class="tag">${esc(row.lg)}</span>${stateTag}<span class="tag">升 ${Number(row.rise) || 0} · 降 ${Number(row.fall) || 0}</span><span class="time">${esc(row.ko.slice(5))}</span></div><div class="score-line"><div class="t">${esc(row.home)}</div><div class="sc${row.sc ? "" : " vs"}">${row.sc ? esc(row.sc) : "VS"}</div><div class="t guest">${esc(row.guest)}</div></div><div class="mv">${chips}</div><div class="result"><div class="k">预测（降买上 / 升买下）</div><div class="pickrow">${pick}</div></div><div class="actual"><span class="k">实际</span>${actual}</div></div>`;
 }
+function statisticsCoverage(plan) {
+  const entries=plan.issues.flatMap(issue=>issueCache.has(issue)?[{issue,record:issueCache.get(issue)}]:[]);
+  const legacy=entries.filter(entry=>!compatibleContract(entry.record.payload)).length;
+  const unverified=entries.filter(entry=>compatibleContract(entry.record.payload)&&!currentContract(entry.record.payload)).length;
+  const pending=entries.filter(entry=>currentContract(entry.record.payload)&&(missingIssues.has(entry.issue)||!cacheFresh(entry.issue,entry.record))).length;
+  const matches=!!loadedPlan && loadedPlan.selection===plan.selection && committedSelection===plan.selection && loadedPlan.fromMs===plan.fromMs && loadedPlan.toMs===plan.toMs;
+  const cancelled=cancelledSelection===plan.selection;
+  const incomplete=entries.length<plan.issues.length || legacy>0 || unverified>0 || !matches || cancelled;
+  const updating=!!activeRequest && activeRequest.stage!=="complete";
+  const mode=incomplete?"incomplete":pending>0||updating?"snapshot":"complete";
+  const times=entries.map(entry=>entry.record.payload.now).filter(value=>Number.isFinite(shanghaiTime(value))).sort();
+  const oldest=times[0] || SNAP,newest=times.at(-1) || SNAP;
+  return {expected:plan.issues.length,acquired:entries.filter(entry=>currentContract(entry.record.payload)).length,missing:plan.issues.length-entries.length,legacy,unverified,pending,matches,cancelled,updating,mode,oldest,newest};
+}
+function renderStatistics(plan,list) {
+  // Keep the observed-sample calculation unchanged; coverage determines what the rate can represent.
+  const settled=list.filter(row=>!isPush(row)&&(row.hit===true||row.hit===false));
+  const wins=settled.filter(row=>row.hit===true).length,pushes=list.filter(isPush).length;
+  const rate=settled.length?(100*wins/settled.length).toFixed(1)+"%":"—";
+  const quality=statisticsCoverage(plan);
+  const range=esc(($("#from").value || plan.firstDay+"T00:00").replace("T"," "))+" ～ "+esc(($("#to").value || plan.lastDay+"T23:59").replace("T"," "));
+  const scopeText={pre:"未开赛",post:"已开赛",all:"全部"}[scope];
+  const detail=[quality.missing?"缺失 "+quality.missing+" 期":"",quality.legacy?"旧版 "+quality.legacy+" 期":"",quality.unverified?"待核实 "+quality.unverified+" 期":"",quality.pending?"快照待更新 "+quality.pending+" 期":""].filter(Boolean).join(" · ");
+  let headline,note="";
+  if(quality.mode==="incomplete") {
+    headline=(quality.cancelled?"搜索已取消，":"")+"所选范围统计未完成 · 完整范围命中率 <span class=\"rate\">—</span>";
+    note=(!quality.matches&&!quality.cancelled?"当前日期条件尚未完成搜索。":"")+(quality.legacy||quality.unverified?"含旧版或待核实数据，现有样本结果待复核。":"")+"已获取样本不代表完整范围，缺失数据未按输处理。";
+  } else if(quality.mode==="snapshot") {
+    headline="快照统计 · 各期抓取时间 "+esc(quality.oldest)+(quality.oldest!==quality.newest?" ～ "+esc(quality.newest):"")+" · 快照命中率 <span class=\"rate\">"+rate+"</span>";
+    note="部分数据尚待更新，以下为已有快照中的已结算样本。";
+  } else headline="所选范围数据已取得 · 命中率 <span class=\"rate\">"+rate+"</span>";
+  const sample="已获取样本：已结算 <b>"+settled.length+"</b> 场 · 命中 <b>"+wins+"</b>"+(quality.mode==="incomplete"?" · 样本命中率 <span class=\"rate\">"+rate+"</span>":"")+(pushes?" · 走水 "+pushes+" 场（不计入命中率）":"");
+  $("#stats").dataset.mode=quality.mode;
+  $("#stats").innerHTML='<div class="stats-range">开赛范围：'+range+' · '+scopeText+'</div><div class="stats-coverage">已核实取得 <b>'+quality.acquired+'</b> / '+quality.expected+' 个赛程期'+(detail?' · '+detail:'')+'</div><div class="stats-status stats-'+quality.mode+'">'+headline+'</div><div class="stats-sample'+(quality.mode==="incomplete"?' stats-sample-incomplete':'')+'">'+sample+'</div>'+(note?'<div class="stats-note">'+note+'</div>':'');
+  return quality;
+}
 function render() {
   let plan;
   try { plan = buildSearchPlan(); }
@@ -233,13 +279,10 @@ function render() {
     html += group("待定 / 推迟", visible.filter(row => Number(row.st) !== 0));
   } else html = group(scope === "post" ? "已开赛" : "全部", visible);
   $("#list").innerHTML = html;
-  $("#count").textContent = `共 ${list.length} 场`;
   $("#loadmore").hidden = list.length <= visibleLimit;
   $("#loadmore").textContent = "加载更多（已显示 " + Math.min(visibleLimit, list.length) + " / " + list.length + " 场）";
-  const settled = list.filter(row => !isPush(row) && (row.hit === true || row.hit === false));
-  const wins = settled.filter(row => row.hit === true).length;
-  const pushes = list.filter(isPush).length;
-  $("#stats").innerHTML = `当前筛选已结算 <b>${settled.length}</b> 场 · 命中 <b>${wins}</b> · <span class="rate">${settled.length ? (100 * wins / settled.length).toFixed(1) + "%" : "—"}</span>${pushes ? " · 走水 " + pushes + " 场" : ""}`;
+  const quality=renderStatistics(plan,list);
+  $("#count").textContent=(quality.mode==="incomplete"?"已加载 ":"共 ")+list.length+" 场";
 }
 function toast(message) { const element = $("#toast"); element.textContent = message; element.classList.add("on"); setTimeout(() => element.classList.remove("on"), 2400); }
 const livebar = document.createElement("div");
@@ -606,7 +649,7 @@ function search(options={}) {
   if(manualResumeRequired && !options.automatic && !options.restore && Date.now()>=nextAllowedAt) {manualResumeRequired=false;blockedReason="";blockedCode="";persistState();}
   if(options.automatic && (!loadedPlan||!automaticIssues(plan).length)) return Promise.resolve();
   const serial=++requestSerial,version=selectionVersion,controller=new AbortController();
-  const request={controller,promise:null,serial};activeRequest=request;
+  const request={controller,promise:null,serial,stage:"loading"};activeRequest=request;cancelledSelection=null;
   $("#search").disabled=true;$("#search").textContent="搜索中…";$("#cancel").hidden=false;
   showStatus("正在获取 "+plan.firstDay+(plan.firstDay===plan.lastDay?"":" 至 "+plan.lastDay)+" 的数据；逐日低频加载，可取消。");
   request.promise=(async()=>{
@@ -621,6 +664,7 @@ function search(options={}) {
       if(!responses.length) {if(paused) {render();resultStatus(plan,responses,failures,true);return;}throw new Error(failures.slice(0,3).map(failure=>failure.issue+"："+failure.error).join("；")||"没有收到有效数据");}
       DATA=collectRows(plan);SNAP=responses.map(response=>response.now).sort().at(-1);ISSUE=plan.firstDay;RANGE=plan.issues.slice();
       committedSelection=plan.selection;loadedPlan=plan;
+      request.stage="complete";
       $("#snap").textContent=plan.firstDay+(plan.firstDay===plan.lastDay?"":" 至 "+plan.lastDay)+" · "+SNAP+" 抓取";
       render();resultStatus(plan,responses,failures,paused);
       if(!options.automatic) {
@@ -651,6 +695,7 @@ function onDateChange() {
   render();
 }
 function cancelSearch() {
+  if(activeRequest) cancelledSelection=selectionKey();
   selectionVersion++;
   requestSerial++;
   if (activeRequest) activeRequest.controller.abort();
