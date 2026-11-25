@@ -621,7 +621,6 @@ function quickRange(kind) {
   $("#to").value = today + "T23:59";
   onDateChange();
   document.querySelectorAll("[data-range]").forEach(element => element.classList.toggle("on", element.dataset.range === kind));
-  if (kind !== "today") setScope("all");
   return search();
 }
 document.querySelectorAll("[data-scope]").forEach(element => element.onclick = () => setScope(element.dataset.scope));
