@@ -899,9 +899,9 @@ $("#search").onclick = () => search();
 $("#cancel").onclick = cancelSearch;
 $("#loadmore").onclick = () => { visibleLimit += 50; render(); };
 async function initialize() {
-  restoreState();const version=selectionVersion;
-  await restoreHistory({shouldRestore:()=>version===selectionVersion});
-  if(version!==selectionVersion) return pendingQuickRange?.promise || activeRequest?.promise;
+  restoreState();const version=selectionVersion,serial=requestSerial;
+  await restoreHistory({shouldRestore:()=>version===selectionVersion && serial===requestSerial});
+  if(version!==selectionVersion || serial!==requestSerial) return pendingQuickRange?.promise || activeRequest?.promise;
   syncPresetHighlight();setScope(scope);
   const plan=buildSearchPlan();
   if(responsesFor(plan).length) {DATA=collectRows(plan);SNAP=responsesFor(plan).map(response=>response.now).sort().at(-1);updateTitle();render();loadedPlan=plan;}
