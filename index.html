@@ -132,7 +132,7 @@ background:#3d1a1a;color:#ffa198;font-size:12px;line-height:1.5"></div>
 <div id="count"></div>
 <footer>数据源：<a href="https://odds.zgzcw.com/" target="_blank" rel="noopener"
 style="color:#58a6ff;text-decoration:none">odds.zgzcw.com</a> 盘口接口 · 点搜索获取所选时间范围；近期数据每 60 秒检查更新，历史结果保留<br>
-脚本版本 2026-11-26-debounce<br>
+脚本版本 2026-11-26-senior<br>
 预测口径：降盘（让球变少）买上盘，升盘（让球变多）买下盘，按变盘公司多数票；票数相同记为分歧。<br>
 仅供数据参考，不构成投注建议。</footer>
 <div class="toast" id="toast"></div>
@@ -141,6 +141,13 @@ const CONFIG = {"rows":[{"ko":"2026-11-26 14:00","ts":1795672800000,"dmin":291,"
 const API_BASE = CONFIG.apiBase || "";
 const API_KEY = CONFIG.apiKey || "";
 const BANDS = CONFIG.bands || [1, 2, 3];
+const EXCLUDED_COMPETITION_LEAGUES = new Set(["乌克青","皇后杯","日皇后杯","台木兰联"]);
+const EXCLUDED_YOUTH_TEAMS = new Set([
+  "阿尔克马尔青年队","乌德勒支青年队","乌得勒支青年队","埃因霍温青年队","阿贾克斯青年队","鹿特丹斯巴达青年队","阿尔梅勒城青年队","沙尔克04青年队",
+  "维也纳快速青年队","奥地利维也纳青年队","格拉茨风暴青年队",
+  "悉尼FC青年队","西悉尼流浪者青年队","中央海岸水手青年队","纽卡斯尔喷气机青年队","墨尔本胜利青年队","西部联青年FC","布里斯班狮吼青年队","珀斯光荣青年队","阿德莱德联青年队",
+  "Jong Ajax","Jong PSV","Jong AZ","Jong Utrecht","Jong Sparta","Jong Almere City"
+].map(name=>name.toLowerCase()));
 let DATA = CONFIG.rows || [];
 let SNAP = CONFIG.now || "";
 let ISSUE = todayShanghai();
@@ -236,6 +243,14 @@ function esc(value) { return String(value ?? "").replace(/[&<>"']/g, char => ({"
 function updateTitle() { if(Number.isFinite(shanghaiTime(SNAP))) document.title="让球盘 0.25 变盘 · "+SNAP.slice(5,16); }
 function isPre(row) { return [0, -11, -14].includes(Number(row.st)); }
 function matchesScope(row) { return scope === "all" || (scope === "pre" ? isPre(row) : !isPre(row)); }
+function isExcludedCompetition(row) {
+  const normalize=value=>String(value || "").normalize("NFKC").trim();
+  const league=normalize(row.lg),teams=[normalize(row.home),normalize(row.guest)];
+  const youthAge=/(?:u|under)[\s._-]*(?:[1-9]|1\d|2[0-3])(?=$|[^0-9])/i;
+  if(EXCLUDED_COMPETITION_LEAGUES.has(league) || /女|women|ladies|girls/i.test(league) || /青年|青少年|青(?:联|杯|锦|超|甲|乙|丙|丁|冠)/.test(league) || youthAge.test(league)) return true;
+  return teams.some(team=>EXCLUDED_YOUTH_TEAMS.has(team.toLowerCase()) || youthAge.test(team) || /女足|女子|女队|女$|[（(]\s*女\s*[）)]|women|ladies|girls|(?:^|\s)w$|[（(]\s*w\s*[）)]/i.test(team));
+}
+function isAllowedFixture(row) { return !isExcludedCompetition(row); }
 function inRange(row, plan) { const timestamp = rowTime(row); return timestamp >= plan.fromMs && timestamp <= plan.toMs; }
 function isPush(row) { return /^(走水|走盘|push)$/i.test(String(row.ahres || row.settlement || "")); }
 function remainingMinutes(row) { return (rowTime(row) - Date.now()) / 60000; }
@@ -285,6 +300,7 @@ function renderStatistics(plan,list) {
     headline="快照统计 · 各期抓取时间 "+esc(quality.oldest)+(quality.oldest!==quality.newest?" ～ "+esc(quality.newest):"")+" · 快照命中率 <span class=\"rate\">"+rate+"</span>";
     note="部分数据尚待更新，以下为已有快照中的已结算样本。";
   } else headline="所选范围数据已取得 · 命中率 <span class=\"rate\">"+rate+"</span>";
+  note="已排除女子及青年赛事。"+note;
   const sample="已获取样本：已结算 <b>"+settled.length+"</b> 场 · 命中 <b>"+wins+"</b>"+(quality.mode==="incomplete"?" · 样本命中率 <span class=\"rate\">"+rate+"</span>":"")+(pushes?" · 走水 "+pushes+" 场（不计入命中率）":"");
   $("#stats").dataset.mode=quality.mode;
   $("#stats").innerHTML='<div class="stats-range">开赛范围：'+range+' · '+scopeText+'</div><div class="stats-coverage">已核实取得 <b>'+quality.acquired+'</b> / '+quality.expected+' 个赛程期'+(detail?' · '+detail:'')+'</div><div class="stats-status stats-'+quality.mode+'">'+headline+'</div><div class="stats-sample'+(quality.mode==="incomplete"?' stats-sample-incomplete':'')+'">'+sample+'</div>'+(note?'<div class="stats-note">'+note+'</div>':'');
@@ -294,7 +310,7 @@ function render() {
   let plan;
   try { plan = buildSearchPlan(); }
   catch (error) { $("#list").innerHTML = `<div class="empty">${esc(error.message)}</div>`; $("#count").textContent = "共 0 场"; $("#stats").textContent = ""; $("#loadmore").hidden = true; return; }
-  const list = DATA.filter(row => matchesScope(row) && inRange(row, plan)).sort((a, b) => (scope === "pre" ? 1 : -1) * (rowTime(a) - rowTime(b)));
+  const list = DATA.filter(row => isAllowedFixture(row) && matchesScope(row) && inRange(row, plan)).sort((a, b) => (scope === "pre" ? 1 : -1) * (rowTime(a) - rowTime(b)));
   const visible = list.slice(0, visibleLimit);
   let html = "";
   const group = (title, rows) => rows.length ? `<h2>${title} <span class="n">${rows.length}</span></h2>` + rows.map(card).join("") : "";
