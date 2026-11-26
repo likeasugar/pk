@@ -132,7 +132,7 @@ background:#3d1a1a;color:#ffa198;font-size:12px;line-height:1.5"></div>
 <div id="count"></div>
 <footer>数据源：<a href="https://odds.zgzcw.com/" target="_blank" rel="noopener"
 style="color:#58a6ff;text-decoration:none">odds.zgzcw.com</a> 盘口接口 · 点搜索获取所选时间范围；近期数据每 60 秒检查更新，历史结果保留<br>
-脚本版本 2026-11-26-live<br>
+脚本版本 2026-11-26-debounce<br>
 预测口径：降盘（让球变少）买上盘，升盘（让球变多）买下盘，按变盘公司多数票；票数相同记为分歧。<br>
 仅供数据参考，不构成投注建议。</footer>
 <div class="toast" id="toast"></div>
@@ -161,6 +161,7 @@ let blockedCode = "";
 let manualResumeRequired = false;
 let savedSelection = null;
 let relativeRange = null;
+let pendingQuickRange = null;
 const missingIssues = new Map();
 const QUERY_CONTRACT = "zgzcw-date-v2", QUERY_COVERAGE = "schedule-period";
 const CACHE_NAMESPACE = "plzx-history-v4-contract:" + (API_BASE || location.href.split("#")[0].split("?")[0]);
@@ -173,6 +174,7 @@ let archiveManifestReadAt = 0;
 let archiveCatchupTimer = null;
 const MANIFEST_TTL = 60000;
 const MANIFEST_LIVE_WAIT = 300;
+const RANGE_DEBOUNCE = 500;
 const ARCHIVE_CATCHUP_BATCH = 32;
 const lastAutomaticRefresh = new Map();
 const lastArchiveRefresh = new Map();
@@ -487,8 +489,9 @@ async function saveIssue(issue, payload) {
   const record = {payload, byteSize:JSON.stringify(payload).length*2, fetchedAt:payload.archive ? shanghaiTime(payload.now) : Date.now(), lastUsedAt:Date.now()}; issueCache.set(issue, record); persistState();
   await diskRequest("readwrite", store=>store.put({key:CACHE_NAMESPACE + "|" + issue, issue, ...record})); await pruneCache();
 }
-async function restoreHistory() {
+async function restoreHistory(options={}) {
   const records = await diskRequest("readonly", store=>store.getAll());
+  if(options.shouldRestore && !options.shouldRestore()) return;
   for (const record of Array.isArray(records) ? records : []) {
     if (!record?.key?.startsWith(CACHE_NAMESPACE + "|") || !Number.isFinite(record.fetchedAt)) continue;
     try { record.payload=validatePayload(record.payload, record.issue);record.byteSize=JSON.stringify(record.payload).length*2; issueCache.set(record.issue, record); } catch (_) { /* Ignore damaged entries. */ }
@@ -750,7 +753,22 @@ function resultStatus(plan,responses,failures,paused) {
   const showPause=(paused||Date.now()<nextAllowedAt)&&needsLive;
   showStatus(missingText+pendingText+archiveText+legacyText+unconfirmedText+snapshotText+(showPause?pauseMessage():"")+warningText+cacheText,failures.length||legacy.length||unconfirmed.length||showPause||recentSnapshots.length?"warning":"info");
 }
+function takePendingRange(settle=true) {
+  const pending=pendingQuickRange;if(!pending) return null;
+  clearTimeout(pending.timer);pendingQuickRange=null;
+  if(!activeRequest) $("#cancel").hidden=true;
+  if(settle) pending.waiters.forEach(resolve=>resolve());
+  return pending;
+}
+function settlePendingRange(pending,promise) {
+  if(pending) Promise.resolve(promise).then(()=>pending.waiters.forEach(resolve=>resolve()),()=>pending.waiters.forEach(resolve=>resolve()));
+}
 function search(options={}) {
+  if(pendingQuickRange && (options.automatic || options.restore)) return Promise.resolve();
+  const pending=takePendingRange(false),promise=executeSearch(options);
+  settlePendingRange(pending,promise);return promise;
+}
+function executeSearch(options={}) {
   rollRelativeRange();
   if(!canRemote()) {render();showStatus("静态快照：数据截至 "+SNAP+"。尚未配置实时数据服务。","warning");return Promise.resolve();}
   if(options.automatic && (document.hidden||selectionKey()!==committedSelection)) return Promise.resolve();
@@ -761,7 +779,7 @@ function search(options={}) {
   if(!options.automatic) {committedSelection=plan.selection;savedSelection=selectionState();persistState();}
   if(manualResumeRequired && !options.automatic && !options.restore && Date.now()>=nextAllowedAt) {manualResumeRequired=false;blockedReason="";blockedCode="";persistState();}
   cancelArchiveCatchup();const serial=++requestSerial,version=selectionVersion,controller=new AbortController();
-  const request={controller,promise:null,serial,stage:"loading"};activeRequest=request;cancelledSelection=null;
+  const request={controller,promise:null,serial,stage:"loading",plan};activeRequest=request;cancelledSelection=null;
   $("#search").disabled=true;$("#search").textContent="搜索中…";$("#cancel").hidden=false;
   showStatus("正在获取 "+plan.firstDay+(plan.firstDay===plan.lastDay?"":" 至 "+plan.lastDay)+" 的数据；逐日低频加载，可取消。");
   request.promise=(async()=>{
@@ -795,6 +813,7 @@ function search(options={}) {
   })();return request.promise;
 }
 function onDateChange(options={}) {
+  takePendingRange();
   if(options.preset!==true) relativeRange=null;
   cancelArchiveCatchup();
   syncPresetHighlight();
@@ -811,8 +830,9 @@ function onDateChange(options={}) {
   render();
 }
 function cancelSearch() {
+  const hadPending=!!pendingQuickRange;takePendingRange();
   cancelArchiveCatchup();
-  if(activeRequest) cancelledSelection=selectionKey();
+  if(activeRequest || hadPending) cancelledSelection=selectionKey();
   selectionVersion++;
   requestSerial++;
   if (activeRequest) activeRequest.controller.abort();
@@ -853,9 +873,23 @@ function syncPresetHighlight() {
 }
 function quickRange(kind) {
   if(!["today","week","month","halfyear"].includes(kind)) kind="today";
+  const pending=takePendingRange(false),values=presetValues(kind),request=activeRequest;
+  if(request?.plan && request.plan.fromMs===shanghaiTime(values.from) && request.plan.toMs===shanghaiTime(values.to)+59999) {
+    applyPreset(kind);syncPresetHighlight();
+    request.plan.selection=selectionKey();committedSelection=selectionKey();savedSelection=selectionState();persistState();
+    settlePendingRange(pending,request.promise);return request.promise;
+  }
   applyPreset(kind);onDateChange({preset:true});
   document.querySelectorAll("[data-range]").forEach(element => element.classList.toggle("on", element.dataset.range === kind));
-  return search();
+  let resolve;const promise=new Promise(done=>{resolve=done;});
+  const scheduled={waiters:[...(pending?.waiters || []),resolve],promise,timer:null};pendingQuickRange=scheduled;
+  savedSelection=selectionState();persistState();$("#cancel").hidden=false;
+  showStatus("正在准备查询，可继续切换或取消。");
+  scheduled.timer=setTimeout(()=>{
+    if(pendingQuickRange!==scheduled) return;
+    takePendingRange(false);settlePendingRange(scheduled,search());
+  },RANGE_DEBOUNCE);
+  return promise;
 }
 document.querySelectorAll("[data-scope]").forEach(element => element.onclick = () => setScope(element.dataset.scope));
 document.querySelectorAll("[data-range]").forEach(element => element.onclick = () => quickRange(element.dataset.range));
@@ -865,7 +899,10 @@ $("#search").onclick = () => search();
 $("#cancel").onclick = cancelSearch;
 $("#loadmore").onclick = () => { visibleLimit += 50; render(); };
 async function initialize() {
-  restoreState();await restoreHistory();syncPresetHighlight();setScope(scope);
+  restoreState();const version=selectionVersion;
+  await restoreHistory({shouldRestore:()=>version===selectionVersion});
+  if(version!==selectionVersion) return pendingQuickRange?.promise || activeRequest?.promise;
+  syncPresetHighlight();setScope(scope);
   const plan=buildSearchPlan();
   if(responsesFor(plan).length) {DATA=collectRows(plan);SNAP=responsesFor(plan).map(response=>response.now).sort().at(-1);updateTitle();render();loadedPlan=plan;}
   committedSelection=selectionKey();
